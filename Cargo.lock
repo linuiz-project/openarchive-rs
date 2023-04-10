@@ -3,5 +3,12 @@
 version = 3
 
 [[package]]
-name = "sevenz-rs"
+name = "libzip"
 version = "0.1.0"
+
+[[package]]
+name = "zip-rs"
+version = "0.1.0"
+dependencies = [
+ "libzip",
+]

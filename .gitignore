@@ -6,3 +6,7 @@ target/
 **/*.rs.bk
 
 **/target
+
+# Binary/library crate hybrid
+
+/.example
