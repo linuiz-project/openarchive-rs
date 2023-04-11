@@ -1,5 +1,8 @@
 #![cfg_attr(not(test), no_std)]
-#![feature(error_in_core)]
+#![feature(
+    error_in_core,
+    array_chunks                    // #74985 <https://github.com/rust-lang/rust/issues/74985>
+)]
 
 use core::{mem::size_of, ptr::NonNull};
 
@@ -30,6 +33,14 @@ pub struct ArchiveHeader {
     uncompressed_size: u64,
 }
 
+unsafe impl bytemuck::CheckedBitPattern for ArchiveHeader {
+    type Bits = [u8; size_of::<Self>()];
+
+    fn is_valid_bit_pattern(bits: &Self::Bits) -> bool {
+        bits.starts_with(Archive::MAGIC)
+    }
+}
+
 impl ArchiveHeader {
     #[inline]
     pub const fn version(&self) -> u32 {
@@ -50,10 +61,14 @@ impl ArchiveHeader {
         (self as *const Self as *const u8).wrapping_add(size_of::<Self>())
     }
 
-    pub fn entry_table(&self) -> Result<NonNull<[ArchiveTableEntry]>> {
-        let ptr =
-            NonNull::new(self.end_ptr() as *const ArchiveTableEntry).ok_or(Error::InternalError)?;
-        Ok(unsafe { core::ptr::NonNull::from_raw_parts(ptr, self.entry_count as usize) })
+    pub fn entry_data(&self) -> Result<&[u8]> {
+        let ptr = NonNull::new(self.end_ptr().cast_mut()).ok_or(Error::InternalError)?;
+        Ok(unsafe {
+            core::slice::from_raw_parts(
+                ptr.as_ptr(),
+                (self.entry_count as usize) * size_of::<Self>(),
+            )
+        })
     }
 }
 
@@ -66,15 +81,8 @@ pub enum TableEntrySignature {
     OS(u32) = u32::MAX,
 }
 
-unsafe impl bytemuck::CheckedBitPattern for TableEntrySignature {
-    type Bits = u64;
-
-    fn is_valid_bit_pattern(bits: &Self::Bits) -> bool {
-        matches!(bits, 0 | 1 | u32::MAX)
-    }
-}
-
 #[repr(C)]
+#[derive(Debug, Clone, Copy)]
 pub struct ArchiveTableEntry {
     signature: TableEntrySignature,
     offset: u64,
@@ -83,16 +91,26 @@ pub struct ArchiveTableEntry {
     extra_data_len: u64,
 }
 
-pub struct Archive<'a> {
-    header: &'a ArchiveHeader,
-}
+unsafe impl bytemuck::NoUninit for ArchiveTableEntry {}
 
-unsafe impl bytemuck::CheckedBitPattern for ArchiveHeader {
+unsafe impl bytemuck::CheckedBitPattern for ArchiveTableEntry {
     type Bits = [u8; size_of::<Self>()];
 
     fn is_valid_bit_pattern(bits: &Self::Bits) -> bool {
-        bits.starts_with(Archive::MAGIC)
+        let signature_bits =
+            u64::from_le_bytes(bits[..size_of::<TableEntrySignature>()].try_into().unwrap());
+        matches!(signature_bits, 0 | 1 | 0xFFFF_FFFF)
     }
+}
+
+impl From<ArchiveTableEntry> for [u8; size_of::<ArchiveTableEntry>()] {
+    fn from(entry: ArchiveTableEntry) -> Self {
+        bytemuck::bytes_of(&entry).try_into().unwrap()
+    }
+}
+
+pub struct Archive<'a> {
+    header: &'a ArchiveHeader,
 }
 
 impl core::ops::Deref for Archive<'_> {
@@ -120,20 +138,17 @@ impl<'a> Archive<'a> {
 }
 
 pub struct ArchiveIterator<'a> {
-    archive: &'a Archive<'a>,
+    entry_data: core::slice::ArrayChunks<'a, u8, { size_of::<ArchiveTableEntry>() }>,
     index: usize,
 }
 
-impl Iterator for ArchiveIterator<'_> {
-    type Item = ArchiveTableEntry;
+impl<'a> Iterator for ArchiveIterator<'a> {
+    type Item = Result<&'a ArchiveTableEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let entry = self.archive.entry_table().get(self.index)?;
+        let entry_datum = self.entry_data.next()?;
         self.index += 1;
 
-        Some(ArchiveEntry {
-            archive: self.archive,
-            entry,
-        })
+        Some(bytemuck::checked::try_from_bytes(entry_datum).map_err(|_| Error::InvalidSignature))
     }
 }
