@@ -1,9 +1,0 @@
-[unstable]
-build-std = ["core", "compiler_builtins", "alloc"]
-build-std-features = ["compiler-builtins-mem"]
-
-[registries.crates-io]
-protocol = "sparse"
-
-[build]
-target = "x86_64-unknown-none"
