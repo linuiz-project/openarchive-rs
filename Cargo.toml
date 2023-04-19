@@ -1,8 +1,15 @@
 [package]
-name = "oa-rs"
+name = "oaf"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 clap = { version = "*", features = ["derive"] }
 bytemuck = { version = "*", features = ["min_const_generics"] }
+xshell = "*"
+num_enum = "*"
+
+
+[features]
+default = ["alloc"]
+alloc = []

@@ -10,4 +10,4 @@ target/
 # Binary/library crate hybrid
 Cargo.lock
 
-/.example
+/testdir

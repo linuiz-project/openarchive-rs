@@ -4,10 +4,19 @@
     array_chunks                    // #74985 <https://github.com/rust-lang/rust/issues/74985>
 )]
 
-use core::{mem::size_of, ptr::NonNull};
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
+#[cfg(feature = "alloc")]
+pub mod builder;
+
+use core::mem::size_of;
 
 pub const MAGIC: &[u8; 8] = b"OARCHIVE";
-pub const VERSIONS: [u32; 1] = [u32::from_le_bytes([0, 0, 1, 0])];
+
+pub const VERSION_0_0_1_0: u32 = u32::from_le_bytes([0, 0, 1, 0]);
+
+pub const VERSIONS: [u32; 1] = [VERSION_0_0_1_0];
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
@@ -30,6 +39,58 @@ impl core::fmt::Display for Error {
 impl core::error::Error for Error {}
 
 pub type Result<T> = core::result::Result<T, Error>;
+
+impl<'a> Archive<'a> {
+    pub fn new(data: &'a [u8]) -> Result<Self> {
+        // TODO pre-handle panic conditions for `split_at`
+
+        let (header_bytes, data) = data.split_at(size_of::<ArchiveHeader>());
+        let header = <&ArchiveHeader>::try_from(header_bytes)?;
+
+        let entry_table_size =
+            usize::try_from(header.entry_count).unwrap() * size_of::<ArchiveTableEntry>();
+        let (entry_table_bytes, data) = data.split_at(entry_table_size);
+        let entry_table = bytemuck::checked::try_cast_slice(entry_table_bytes)
+            .map_err(|_| Error::InvalidEntryTable)?;
+
+        let (names_bytes, data) = data.split_at(usize::try_from(header.names_size).unwrap());
+        let (extra_data_bytes, data) =
+            data.split_at(usize::try_from(header.extra_data_size).unwrap());
+
+        Ok(Self {
+            header,
+            entry_table,
+            names: names_bytes,
+            extra_data: extra_data_bytes,
+            data,
+        })
+    }
+
+    pub fn iter(&self) -> ArchiveIterator {
+        ArchiveIterator {
+            entries: self.entry_table,
+            names: self.names,
+            extra_data: self.extra_data,
+            data: self.data,
+            index: 0,
+        }
+    }
+}
+
+impl core::fmt::Debug for Archive<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Archive")
+            .field("Version", &self.version.to_le_bytes())
+            .field("Entry Count", &self.entry_count())
+            .field("Names Size", &self.names_size())
+            .field("Names Bytes", &self.names)
+            .field("Extra Data Size", &self.extra_data_size())
+            .field("Extra Data Bytes", &self.extra_data)
+            .field("Uncompressed Size", &self.uncompressed_size())
+            .field("Data Bytes", &self.data)
+            .finish()
+    }
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -63,6 +124,23 @@ impl<'a> TryFrom<&'a [u8]> for &'a ArchiveHeader {
 }
 
 impl ArchiveHeader {
+    pub(crate) fn new(
+        version: u32,
+        entry_count: u32,
+        names_size: u64,
+        extra_data_size: u64,
+        uncompressed_size: u64,
+    ) -> Self {
+        ArchiveHeader {
+            _magic: *MAGIC,
+            version,
+            entry_count,
+            names_size,
+            extra_data_size,
+            uncompressed_size,
+        }
+    }
+
     #[inline]
     pub const fn version(&self) -> u32 {
         self.version
@@ -74,38 +152,45 @@ impl ArchiveHeader {
     }
 
     #[inline]
+    pub const fn names_size(&self) -> u64 {
+        self.names_size
+    }
+
+    #[inline]
+    pub const fn extra_data_size(&self) -> u64 {
+        self.extra_data_size
+    }
+
+    #[inline]
     pub const fn uncompressed_size(&self) -> u64 {
         self.uncompressed_size
-    }
-
-    const fn end_ptr(&self) -> *const u8 {
-        (self as *const Self as *const u8).wrapping_add(size_of::<Self>())
-    }
-
-    pub fn entry_data(&self) -> Result<&[u8]> {
-        let ptr = NonNull::new(self.end_ptr().cast_mut()).ok_or(Error::InternalError)?;
-        Ok(unsafe {
-            core::slice::from_raw_parts(
-                ptr.as_ptr(),
-                (self.entry_count as usize) * size_of::<Self>(),
-            )
-        })
     }
 }
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TableEntrySignature {
+pub enum Signature {
     File = 0,
     Directory = 1,
 
     OS(u32) = u32::MAX,
 }
 
+unsafe impl bytemuck::CheckedBitPattern for Signature {
+    type Bits = [u8; size_of::<Self>()];
+
+    fn is_valid_bit_pattern(bits: &Self::Bits) -> bool {
+        matches!(
+            u32::from_le_bytes(bits[..size_of::<u32>()].try_into().unwrap()),
+            0 | 1 | u32::MAX
+        )
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct ArchiveTableEntry {
-    signature: TableEntrySignature,
+pub(crate) struct ArchiveTableEntry {
+    signature: Signature,
     name_offset: u64,
     name_len: u64,
     extra_data_offset: u64,
@@ -115,20 +200,35 @@ pub struct ArchiveTableEntry {
 }
 
 unsafe impl bytemuck::NoUninit for ArchiveTableEntry {}
-
 unsafe impl bytemuck::CheckedBitPattern for ArchiveTableEntry {
     type Bits = [u8; size_of::<Self>()];
 
     fn is_valid_bit_pattern(bits: &Self::Bits) -> bool {
-        let signature_bits =
-            u64::from_le_bytes(bits[..size_of::<TableEntrySignature>()].try_into().unwrap());
-        matches!(signature_bits, 0 | 1 | 0xFFFF_FFFF)
+        <Signature as bytemuck::CheckedBitPattern>::is_valid_bit_pattern(
+            bits[..size_of::<Signature>()].try_into().unwrap(),
+        )
     }
 }
 
-impl From<ArchiveTableEntry> for [u8; size_of::<ArchiveTableEntry>()] {
-    fn from(entry: ArchiveTableEntry) -> Self {
-        bytemuck::bytes_of(&entry).try_into().unwrap()
+impl ArchiveTableEntry {
+    pub fn new(
+        signature: Signature,
+        name_offset: u64,
+        name_len: u64,
+        extra_data_offset: u64,
+        extra_data_len: u64,
+        data_offset: u64,
+        data_len: u64,
+    ) -> Self {
+        Self {
+            signature,
+            name_offset,
+            name_len,
+            extra_data_offset,
+            extra_data_len,
+            data_offset,
+            data_len,
+        }
     }
 }
 
@@ -146,44 +246,6 @@ impl core::ops::Deref for Archive<'_> {
 
     fn deref(&self) -> &Self::Target {
         self.header
-    }
-}
-
-impl<'a> Archive<'a> {
-    pub fn from_bytes(data: &'a [u8]) -> Result<Self> {
-        // TODO pre-handle panic conditions for `split_at`
-
-        let (header_bytes, data) = data.split_at(size_of::<ArchiveHeader>());
-        let header = <&ArchiveHeader>::try_from(header_bytes)?;
-
-        let entry_table_size =
-            usize::try_from(header.entry_count).unwrap() * size_of::<ArchiveTableEntry>();
-        let (entry_table_bytes, data) = data.split_at(entry_table_size);
-        let entry_table: &[ArchiveTableEntry] =
-            bytemuck::checked::try_cast_slice(entry_table_bytes)
-                .map_err(|_| Error::InvalidEntryTable)?;
-
-        let (names_bytes, data) = data.split_at(usize::try_from(header.names_size).unwrap());
-        let (extra_data_bytes, data) =
-            data.split_at(usize::try_from(header.extra_data_size).unwrap());
-
-        Ok(Self {
-            header,
-            entry_table,
-            names: names_bytes,
-            extra_data: extra_data_bytes,
-            data,
-        })
-    }
-
-    pub fn iter(&self) -> ArchiveIterator {
-        ArchiveIterator {
-            entries: self.entry_table,
-            names: self.names,
-            extra_data: self.extra_data,
-            data: self.data,
-            index: 0,
-        }
     }
 }
 
